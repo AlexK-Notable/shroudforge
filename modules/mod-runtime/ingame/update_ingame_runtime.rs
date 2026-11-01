@@ -40,6 +40,7 @@ impl IngameRuntime {
             } else {
                 shroudforge_steam_networking::service_shutdown();
             }
+            self.process_admin_requests();
             self.refresh_configuration();
             self.publish_status(true);
             self.next_status = std::time::Instant::now() + std::time::Duration::from_secs(1);

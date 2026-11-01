@@ -1,0 +1,15 @@
+{
+  "package": "EMF 0.3.3 manual",
+  "license": "MIT",
+  "api": 21,
+  "files": {
+    "game/dinput8.dll": "2289c4740870b00dc1c909899706f0539445c7f40683a362e39ce4890d8109e3",
+    "game/emf/emf_core.dll": "f3abc4a1d41a120a7b24e526306e4c725ea3e5414e02c2f3f47acb2e981041e7",
+    "sdk/include/emf/emf_api.h": "4b5bf00667bc88671774c1b11d63768edcbfd7a2e23fc8bbe8017a9cc614f176",
+    "sdk/include/emf/emf.hpp": "937abcc2a13ab23b0e1ecd82c118a751a52ecc83d5e832394ca3051fd4e9e50f",
+    "sdk/include/emf/inventory.hpp": "f6358950e72017700563ef1c249a1e1bfbff341740b5eff2cf2075843d5ca0a1",
+    "sdk/include/emf/teleport.hpp": "87712e3f81a8abae204f7853c855524061f60c80ffca80b02c520f68ac13ba3b",
+    "sdk/include/emf/query.hpp": "1c1d76c95d08fd1d9c5677273ddfdc2735b2dda2c51a43bb3a9bd9e76ac385fc",
+    "sdk/include/emf/generated/components.hpp": "9976a9817793be7c2a8f6fd192d6d5ce7d3837bfba0c98c005071d32166eace7"
+  }
+}

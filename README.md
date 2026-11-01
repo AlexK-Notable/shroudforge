@@ -1,5 +1,7 @@
 # ShroudForge
 
+
+> This fork adds [Emberwatch local server administration](modules/server-admin/README.md): a dashboard, acknowledged live commands, native inventory transactions, recorded death-site teleports and live world settings. Gameplay modifiers remain opt-in.
 [![Made With Love](https://img.shields.io/badge/Made%20with%20%E2%9D%A4%EF%B8%8F-by%20bonsaibauer-green)](https://github.com/bonsaibauer)
 [![Repository](https://img.shields.io/badge/Repository-shroudforge-blue?style=flat&logo=github)](https://github.com/bonsaibauer/shroudforge)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/bonsaibauer/shroudforge/blob/main/LICENSE)

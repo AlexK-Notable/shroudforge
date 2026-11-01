@@ -37,6 +37,7 @@ modules/                       # Product modules and application entrypoints
     tests/                    # Rust and Python checks with private Lua fixtures
   debug-console/              # Separate log window
   world-editor/               # Separate editor window
+  server-admin/               # Local dashboard, command protocol and native administration adapter
   commands/                   # Existing command mode
   transport/                  # Steam messages and network health
   ui-resources/               # Shared display elements and translations

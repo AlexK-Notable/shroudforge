@@ -6,6 +6,7 @@ mod load_native_plugins;
 mod load_runtime_callbacks;
 mod plan_runtime_mods;
 mod process_runtime_reload_request;
+mod process_admin_requests;
 mod publish_runtime_status;
 mod refresh_runtime_configuration;
 mod reload_runtime_packages;

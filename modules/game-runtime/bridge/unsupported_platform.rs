@@ -86,6 +86,9 @@ pub fn world_context_active() -> bool {
 pub fn world_context_kind() -> u32 {
     0
 }
+pub fn world_entity_query_props_ready() -> bool {
+    false
+}
 pub fn world_entity_context_ready() -> bool {
     false
 }

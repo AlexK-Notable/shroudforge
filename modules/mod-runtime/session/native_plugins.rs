@@ -282,8 +282,19 @@ fn load_native_library(mod_id: &str, path: &std::path::Path) -> Result<isize, St
             std::io::Error::last_os_error()
         ))
     } else {
+        // Native initializers can register engine hooks whose lifetime exceeds a Lua VM.
+        // Pin the module before allowing a runtime package refresh to drop its owner.
+        let mut pinned = std::ptr::null_mut();
+        unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleExW(
+                windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_PIN
+                    | windows_sys::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                handle as *const u16,
+                &mut pinned,
+            );
+        }
         tracing::debug!(target: "shroudforge::runtime", mod_id, dll = %path.display(),
-            "LoadLibraryExW returned on isolated worker");
+            "LoadLibraryExW returned on isolated worker; native hooks remain process-owned");
         Ok(handle as isize)
     }
 }
