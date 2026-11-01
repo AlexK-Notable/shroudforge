@@ -55,11 +55,51 @@ fn clean(stage: &Path) -> io::Result<()> {
     fs::remove_dir(stage)
 }
 
+// The session's KFC reader keeps the published files open. Windows frees a deleted
+// name at once (POSIX delete semantics), but Wine/Proton keeps an open file's name
+// until its last handle closes and refuses to rename over an open file. Renaming
+// the open file aside works on both, so the old file moves out of the way first.
 fn replace(source: &Path, target: &Path) -> io::Result<()> {
-    if target.exists() {
-        fs::remove_file(target)?;
+    if !target.exists() {
+        return fs::rename(source, target);
     }
-    fs::rename(source, target)
+    let displaced = displaced_path(target)?;
+    fs::rename(target, &displaced)?;
+    if let Err(error) = fs::rename(source, target) {
+        let _ = fs::rename(&displaced, target);
+        return Err(error);
+    }
+    // Removed now on Windows, once the reader closes it on Wine.
+    let _ = fs::remove_file(displaced);
+    Ok(())
+}
+
+const DISPLACED_MARKER: &str = ".shroudforge-old-";
+
+// Unique per call: an earlier displaced copy of the same file can still be open.
+fn displaced_path(target: &Path) -> io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = target.file_name().ok_or_else(invalid)?.to_string_lossy();
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    Ok(target.with_file_name(format!(
+        ".{name}{DISPLACED_MARKER}{}-{id}",
+        std::process::id()
+    )))
+}
+
+// Displaced files a previous process could not delete (still open when it ended).
+fn remove_displaced(root: &Path, stem: &str) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let prefix = format!(".{stem}");
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.contains(DISPLACED_MARKER) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn recover(root: &Path, stem: &str) -> io::Result<()> {
@@ -83,6 +123,7 @@ pub fn recover(root: &Path, stem: &str) -> io::Result<()> {
 
 pub fn begin(root: &Path, stem: &str) -> io::Result<PathBuf> {
     recover(root, stem)?;
+    remove_displaced(root, stem);
     let stage = directory(root, stem);
     fs::create_dir(&stage)?;
     Ok(stage)
@@ -206,6 +247,27 @@ mod tests {
             b"new-data"
         );
         assert!(!stage.exists());
+        remove_fixture(&root);
+    }
+
+    #[test]
+    fn commit_publishes_while_reader_holds_old_files() {
+        use std::io::Read;
+        let root = fixture();
+        let mut reader = fs::File::open(root.join("game.kfc_resources")).unwrap();
+        let stage = begin(&root, "game").unwrap();
+        fs::write(stage.join("game.kfc"), b"new-index").unwrap();
+        fs::write(stage.join("game.kfc_resources"), b"new-data").unwrap();
+        commit(&root, "game").unwrap();
+        let mut old = Vec::new();
+        reader.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old-data");
+        assert_eq!(
+            fs::read(root.join("game.kfc_resources")).unwrap(),
+            b"new-data"
+        );
+        drop(reader);
+        remove_displaced(&root, "game");
         remove_fixture(&root);
     }
 }
