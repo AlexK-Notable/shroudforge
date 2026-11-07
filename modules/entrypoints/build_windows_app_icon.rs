@@ -1,6 +1,7 @@
 use std::{error::Error, fs, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-env-changed=SHROUDFORGE_NO_APP_ICON");
     if std::env::var("CARGO_CFG_TARGET_OS")? != "windows" || std::env::var_os("SHROUDFORGE_NO_APP_ICON").is_some() {
         return Ok(());
     }

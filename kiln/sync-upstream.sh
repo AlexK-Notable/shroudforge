@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
 # Kiln layer (MIT): merge an upstream ShroudForge release branch into this fork's `kiln` branch, rebuild, test.
 #   kiln/sync-upstream.sh <upstream-branch> [--scratch]     e.g. kiln/sync-upstream.sh 1.8.0
-# Steps: fetch upstream (bonsaibauer/shroudforge) with tags; merge upstream/<branch> into the current branch with
-# --no-commit (--scratch: into a throwaway worktree on branch scratch/merge-<branch>, removed afterwards); list
-# conflicts and stop if there are any; update submodules; write kiln/UPSTREAM-VERSION; run kiln/build.sh and the host
-# tests below; check that the C interface Kiln drives is unchanged. Never commits or pushes: review, then commit.
+# Requires a clean kiln branch and the official upstream remote. Fetches the named branch without changing tags,
+# merges FETCH_HEAD with --no-commit, validates the bootstrap contract, rebuilds and tests. --scratch uses a detached
+# worktree retained for review (including conflicts). Never commits, pushes, force-removes worktrees or deletes branches.
 set -euo pipefail
 branch=${1:?usage: kiln/sync-upstream.sh <upstream-branch> [--scratch]}
 scratch=${2:-}
+[[ $# -le 2 && ( -z $scratch || $scratch == --scratch ) ]] || { echo "unknown arguments" >&2; exit 2; }
+git check-ref-format "refs/heads/$branch" >/dev/null || { echo "invalid upstream branch" >&2; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
-git remote get-url upstream >/dev/null 2>&1 || git remote add upstream https://github.com/bonsaibauer/shroudforge.git
-git fetch --tags upstream "$branch"
+[[ $(git branch --show-current) == kiln ]] || { echo "run on branch kiln" >&2; exit 1; }
+[[ -z $(git status --porcelain --untracked-files=all --ignore-submodules=none) ]] || { echo "working tree/submodules must be clean" >&2; exit 1; }
+for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+  [[ ! -f $(git rev-parse --git-path "$state") ]] || { echo "finish the existing Git operation first" >&2; exit 1; }
+done
+url=$(git remote get-url upstream)
+[[ $url == https://github.com/bonsaibauer/shroudforge.git ]] || { echo "unexpected upstream remote: $url" >&2; exit 1; }
+git fetch --no-tags upstream "refs/heads/$branch"
+upstream=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
 work=$root
 if [[ $scratch == --scratch ]]; then
-  work=${KILN_SF_SCRATCH:-$(mktemp -d)}/merge-$branch
-  git worktree add -q "$work" -b "scratch/merge-$branch" HEAD
-  trap 'git -C "$root" worktree remove --force "$work"; git -C "$root" branch -D "scratch/merge-$branch" >/dev/null' EXIT
+  scratch_root=$(mktemp -d "${KILN_SF_SCRATCH:-${TMPDIR:-/tmp}}/kiln-sf-merge.XXXXXX")
+  work=$scratch_root/work
+  git worktree add -q --detach "$work" HEAD
+  # Preserve conflict/build evidence; never force-remove a dirty worktree or delete a branch.
+  trap 'echo "scratch worktree kept at $work (remove it after review)" >&2' EXIT
 fi
 cd "$work"
-if ! git merge --no-commit --no-ff "upstream/$branch"; then
+if ! git merge --no-commit --no-ff "$upstream"; then
   echo "== conflicts:"; git diff --name-only --diff-filter=U
   echo "Resolve them (keep upstream's side unless kiln/UPSTREAM-PATCHES.md lists the file), then rerun the build." >&2
   exit 1
@@ -33,10 +43,13 @@ done
 for sym in shroudforge_prepare_startup shroudforge_create shroudforge_update shroudforge_destroy; do
   grep -q "fn $sym" modules/entrypoints/loader/embedded.rs || { echo "missing export $sym: kiln-shroudforge needs an update" >&2; exit 1; }
 done
-grep -n 'KFC_RUNTIME_ABI_VERSION' modules/game-runtime/native/abi/runtime_api.h
+grep -Eq '^#define KFC_RUNTIME_ABI_VERSION 12u$' modules/game-runtime/native/abi/runtime_api.h || {
+  echo "native ABI changed: update kiln-shroudforge before merging" >&2; exit 1;
+}
+python3 kiln/check-contract.py
 git submodule update --init --recursive kfc-parser modules/game-runtime/native/json modules/hotkeys/SDL
 echo "$branch" | sed 's/^v//' > kiln/UPSTREAM-VERSION
-SF_UI_REBUILD=1 kiln/build.sh "${KILN_SF_OUT:-$work/kiln/out}"
+KILN_SF_ALLOW_DIRTY=1 kiln/build.sh "${KILN_SF_OUT:-$work/kiln/out}"
 # tests: the loader-config tests run on the Linux host; upstream's other test crates are Windows-only (zip and Win32
 # dependencies), so they are compiled for Windows (KILN_SF_WINE_TESTS=1 also runs them under Wine)
 cargo test --locked -q -p shroudforge-loader-config

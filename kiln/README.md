@@ -29,8 +29,8 @@ C functions. With a setting, it drives the player's installed ShroudForge instea
 ## Merging upstream
 
 ```
-kiln/sync-upstream.sh 1.8.0 --scratch     # trial run in a throwaway worktree: conflicts, build, tests
-kiln/sync-upstream.sh 1.8.0               # for real, on the kiln branch (not committed: review, then commit)
+kiln/sync-upstream.sh 1.8.0 --scratch     # trial run in an isolated worktree (retained): conflicts, build, tests
+kiln/sync-upstream.sh 1.8.0               # for real, on the kiln branch (uncommitted merge: review, then commit)
 ```
 Resolve conflicts on upstream's side unless the file is in `UPSTREAM-PATCHES.md`. Then bump Kiln's submodule
 `third_party/shroudforge` to the new commit.
@@ -45,3 +45,11 @@ ShroudForge is MIT. `shroudforge-runtime.dll` statically links kfc-parser (Brabb
 is distributed under the GPL-3.0. Kiln ships it as a separate component with `LICENSES/`, `NOTICE.txt`, `SOURCE.txt`
 and, in each Kiln release, `shroudforge-kiln-<commit>-src.tar.gz` (this tree with its submodules). Files in `kiln/` are
 MIT.
+
+Builds require a clean tree and validate initialized submodules against their gitlinks without updating any checkout.
+`KILN_SF_ALLOW_DIRTY=1` permits an explicitly marked development build; sync uses it for its uncommitted merge. Release exports carry
+`KILN-SOURCE-COMMIT`, `KILN-SOURCE-EPOCH` and `KILN-SOURCE-SUBMODULES.json` from Kiln's recursive source exporter;
+no Git repository is needed to build them. UI assets are rebuilt, paths remapped, and staged mtimes normalized.
+`sync-upstream.sh` requires a clean `kiln` branch and the official upstream remote, merges the fetched commit directly,
+and checks the exact ABI/signatures. Scratch worktrees are retained for review, including conflicts; no force removal,
+branch deletion, commit or push is performed by the script.

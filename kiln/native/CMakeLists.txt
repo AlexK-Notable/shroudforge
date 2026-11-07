@@ -14,3 +14,9 @@ if(EXISTS "${_kiln_rc}")
     string(REGEX REPLACE "\"([A-Z_]+)\" RCDATA" "\\1 RCDATA" _kiln_rc_text "${_kiln_rc_text}")
     file(WRITE "${_kiln_rc}" "${_kiln_rc_text}")
 endif()
+
+# Kiln's standalone cross build must not expose absolute build/source paths or wall-clock PE timestamps.
+get_filename_component(_kiln_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+target_compile_options(kfc-runtime PRIVATE "/clang:-ffile-prefix-map=${_kiln_root}=/shroudforge"
+    "/clang:-ffile-prefix-map=${CMAKE_BINARY_DIR}=/build/shroudforge")
+target_link_options(kfc-runtime PRIVATE /Brepro /pdbaltpath:%_PDB%)
