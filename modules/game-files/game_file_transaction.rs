@@ -6,11 +6,61 @@
 
 use std::{
     fs, io,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 fn invalid() -> io::Error {
     io::Error::other("invalid ShroudForge asset transaction")
+}
+
+// Never follow operator/cache-controlled links while cleaning or restoring an interrupted transaction.
+fn metadata(path: &Path) -> io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    return Err(invalid());
+                }
+            }
+            if meta.file_type().is_symlink() {
+                return Err(invalid());
+            }
+            Ok(Some(meta))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn regular(path: &Path, required: bool) -> io::Result<()> {
+    match metadata(path)? {
+        Some(meta) if meta.is_file() => Ok(()),
+        None if !required => Ok(()),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing transaction file",
+        )),
+        _ => Err(invalid()),
+    }
+}
+
+fn stage_path(root: &Path, stem: &str) -> io::Result<PathBuf> {
+    if stem.is_empty()
+        || stem.len() > 128
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(invalid());
+    }
+    let stage = directory(root, stem);
+    if metadata(&stage)?.is_some_and(|meta| !meta.is_dir()) {
+        return Err(invalid());
+    }
+    Ok(stage)
 }
 
 fn sync(path: &Path) -> io::Result<()> {
@@ -33,29 +83,50 @@ fn valid_name(stem: &str, name: &str) -> bool {
 }
 
 fn records(stage: &Path, stem: &str) -> io::Result<Vec<(String, bool)>> {
-    let records: Vec<(String, bool)> =
-        serde_json::from_slice(&fs::read(stage.join("pending.json"))?).map_err(|_| invalid())?;
-    if records.iter().any(|(name, _)| !valid_name(stem, name)) {
+    const MAX_JOURNAL: u64 = 8 * 1024 * 1024;
+    let journal = stage.join("pending.json");
+    regular(&journal, true)?;
+    let mut bytes = Vec::new();
+    fs::File::open(journal)?
+        .take(MAX_JOURNAL + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_JOURNAL {
+        return Err(invalid());
+    }
+    let records: Vec<(String, bool)> = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let mut names = std::collections::HashSet::new();
+    if records.len() > 16384
+        || records
+            .iter()
+            .any(|(name, _)| !valid_name(stem, name) || !names.insert(name))
+    {
         return Err(invalid());
     }
     Ok(records)
 }
 
 fn clean(stage: &Path) -> io::Result<()> {
-    if !stage.exists() {
-        return Ok(());
+    match metadata(stage)? {
+        None => return Ok(()),
+        Some(meta) if meta.is_dir() => {}
+        _ => return Err(invalid()),
     }
+    // Validate the complete directory before deleting its first file.
+    let mut files = Vec::new();
     for entry in fs::read_dir(stage)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            return Err(invalid());
-        }
-        fs::remove_file(entry.path())?;
+        regular(&entry.path(), true)?;
+        files.push(entry.path());
+    }
+    for file in files {
+        fs::remove_file(file)?;
     }
     fs::remove_dir(stage)
 }
 
 fn replace(source: &Path, target: &Path) -> io::Result<()> {
+    regular(source, true)?;
+    regular(target, false)?;
     // Removing first leaves an open Windows file delete-pending and prevents
     // reuse of its path. A single replacement also preserves the old file when
     // publication fails, so recovery can be retried after a foreign lock closes.
@@ -72,9 +143,19 @@ fn replace(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 pub fn recover(root: &Path, stem: &str) -> io::Result<()> {
-    let stage = directory(root, stem);
-    if stage.join("pending.json").is_file() {
-        for (name, existed) in records(&stage, stem)? {
+    let stage = stage_path(root, stem)?;
+    if metadata(&stage.join("pending.json"))?.is_some() {
+        let records = records(&stage, stem)?;
+        regular(&stage.join("completed.json"), false)?;
+        // Refuse every unsafe input before mutating any live asset.
+        for (name, existed) in &records {
+            regular(&root.join(name), false)?;
+            if *existed {
+                regular(&stage.join(format!("{name}.rollback")), true)?;
+                regular(&stage.join(format!("{name}.restore")), false)?;
+            }
+        }
+        for (name, existed) in records {
             let target = root.join(&name);
             if existed {
                 let restore = stage.join(format!("{name}.restore"));
@@ -92,7 +173,7 @@ pub fn recover(root: &Path, stem: &str) -> io::Result<()> {
 
 pub fn begin(root: &Path, stem: &str) -> io::Result<PathBuf> {
     recover(root, stem)?;
-    let stage = directory(root, stem);
+    let stage = stage_path(root, stem)?;
     fs::create_dir(&stage)?;
     Ok(stage)
 }
@@ -102,15 +183,20 @@ pub fn abort(root: &Path, stem: &str) -> io::Result<()> {
 }
 
 fn prepare(root: &Path, stem: &str) -> io::Result<Vec<(String, bool)>> {
-    let stage = directory(root, stem);
+    let stage = stage_path(root, stem)?;
     let mut files = Vec::new();
     for entry in fs::read_dir(&stage)? {
         let entry = entry?;
         let name = entry.file_name().into_string().map_err(|_| invalid())?;
-        if !entry.file_type()?.is_file() || !valid_name(stem, &name) {
+        regular(&entry.path(), true)?;
+        if !valid_name(stem, &name) {
             return Err(invalid());
         }
+        regular(&root.join(&name), false)?;
         files.push(name);
+        if files.len() > 16384 {
+            return Err(invalid());
+        }
     }
 
     // Publish the index last, after every referenced data file is in place.
@@ -139,7 +225,7 @@ fn prepare(root: &Path, stem: &str) -> io::Result<Vec<(String, bool)>> {
 }
 
 pub fn commit(root: &Path, stem: &str) -> io::Result<()> {
-    let stage = directory(root, stem);
+    let stage = stage_path(root, stem)?;
     let records = prepare(root, stem)?;
     let publish = (|| {
         for (name, _) in records {
@@ -259,5 +345,70 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert_eq!(fs::read(root.join("game.kfc")).unwrap(), b"old-index");
         remove_fixture(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_stage_cannot_delete_unrelated_files() {
+        use std::os::unix::fs::symlink;
+        let root = fixture();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"unrelated").unwrap();
+        symlink(&outside, directory(&root, "game")).unwrap();
+        assert!(recover(&root, "game").is_err());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"unrelated");
+        assert!(begin(&root, "game").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_recovery_inputs_preserve_live_assets_and_external_files() {
+        use std::os::unix::fs::symlink;
+        for name in ["pending.json", "game.kfc.rollback", "game.kfc.restore"] {
+            let root = fixture();
+            let stage = begin(&root, "game").unwrap();
+            let external = root.join("external");
+            fs::write(&external, b"unrelated").unwrap();
+            fs::write(stage.join("pending.json"), br#"[["game.kfc",true]]"#).unwrap();
+            fs::write(stage.join("game.kfc.rollback"), b"replacement").unwrap();
+            let link = stage.join(name);
+            if link.exists() {
+                fs::remove_file(&link).unwrap();
+            }
+            symlink(&external, &link).unwrap();
+            assert!(recover(&root, "game").is_err(), "{name}");
+            assert_eq!(fs::read(&external).unwrap(), b"unrelated", "{name}");
+            assert_eq!(
+                fs::read(root.join("game.kfc")).unwrap(),
+                b"old-index",
+                "{name}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_validates_the_complete_journal_before_replacing_assets() {
+        let root = fixture();
+        let stage = begin(&root, "game").unwrap();
+        fs::write(stage.join("game.kfc.rollback"), b"replacement").unwrap();
+        fs::write(
+            stage.join("pending.json"),
+            br#"[["game.kfc",true],["../external",false]]"#,
+        )
+        .unwrap();
+        assert!(recover(&root, "game").is_err());
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), b"old-index");
+        fs::write(
+            stage.join("pending.json"),
+            br#"[["game.kfc",true],["game.kfc",false]]"#,
+        )
+        .unwrap();
+        assert!(recover(&root, "game").is_err());
+        assert!(begin(&root, "../game").is_err());
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), b"old-index");
+        fs::remove_dir_all(root).unwrap();
     }
 }
