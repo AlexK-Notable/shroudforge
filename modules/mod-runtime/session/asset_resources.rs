@@ -146,7 +146,11 @@ impl AppState {
 
     #[inline]
     pub fn reader(&self) -> RefMut<'_, KFCCursor<KFCReader>> {
-        self.reader.borrow_mut()
+        RefMut::map(self.reader.borrow_mut(), |reader| {
+            reader
+                .as_mut()
+                .expect("asset reader is closed after publication")
+        })
     }
 
     #[inline]
@@ -161,6 +165,9 @@ impl AppState {
         if !self.asset_transaction.get() {
             return Err(LuaError::generic("typed asset transaction is unavailable"));
         }
+        // Resource conversion has finished. KFCCursor retains a live resource
+        // file handle; close it before replacing or recovering that path.
+        drop(self.reader.borrow_mut().take());
         shroudforge_game_assets::transaction::commit(
             self.env.game_dir().as_std_path(),
             &self.asset_stem,
@@ -284,7 +291,7 @@ impl AppState {
             Ok(Some(value.clone()))
         } else {
             // OPTIMIZE: consider using a reader for this
-            Ok(self.reader.borrow_mut().read_content(guid)?)
+            Ok(self.reader().read_content(guid)?)
         }
     }
 
@@ -306,5 +313,128 @@ impl AppState {
         }
 
         Ok(guid)
+    }
+}
+
+#[cfg(test)]
+mod asset_transaction_tests {
+    use super::*;
+    use std::{fs, path::PathBuf as StdPathBuf};
+
+    fn fixture() -> (StdPathBuf, AppState) {
+        let root = std::env::temp_dir().join(format!("sf-session-assets-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("mods")).unwrap();
+        for extension in ["kfc", "kfc_resources"] {
+            fs::write(root.join(format!("game.{extension}")), []).unwrap();
+        }
+        let type_registry = Rc::new(TypeRegistry::default());
+        KFCWriter::<Rc<KFCFile>, _>::new(&root, "game", type_registry.clone(), "fixture")
+            .unwrap()
+            .finalize()
+            .unwrap();
+        let root_utf8 = PathBuf::from_path_buf(root.clone()).unwrap();
+        let env = ModEnvironment::load(&root_utf8).unwrap();
+        let ref_file = crate::game_files::load_kfc_file(root_utf8.join("game.kfc")).unwrap();
+        let reader =
+            crate::game_files::create_reader_with_extension(&root_utf8, "game", "kfc").unwrap();
+        let stage = shroudforge_game_assets::transaction::begin(&root, "game").unwrap();
+        for extension in ["kfc", "kfc_resources"] {
+            let name = format!("game.{extension}");
+            fs::copy(root.join(&name), stage.join(&name)).unwrap();
+        }
+        let writer = crate::game_files::create_writer(
+            &PathBuf::from_path_buf(stage).unwrap(),
+            "game",
+            &type_registry,
+            &ref_file,
+        )
+        .unwrap();
+        let api = ShroudForgeApi::new(
+            shroudforge_compatibility::Compatibility::new(Vec::<String>::new())
+                .resolve(kfc::schema_from_registry(&type_registry, &ref_file)),
+        );
+        let state = AppState {
+            runtime_configured: Cell::new(false),
+            runtime_active_mods: RefCell::default(),
+            runtime_effects: RefCell::default(),
+            runtime_write_fault: RefCell::default(),
+            runtime_ownership: Rc::new(RefCell::default()),
+            env,
+            api,
+            config: AppConfig {
+                is_server: true,
+                phase: RuntimePhase::Pregame,
+                feature_flags: AppFeatures::PATCH,
+                export_dir: root_utf8.join("exports"),
+            },
+            type_registry,
+            attribute_catalog: OnceCell::new(),
+            inline_fields: RefCell::default(),
+            inline_field_bytes: Cell::new(0),
+            ref_file,
+            reader: RefCell::new(Some(reader)),
+            writer: RefCell::new(Some(writer)),
+            asset_transaction: Cell::new(true),
+            asset_stem: "game".to_owned(),
+            new_contents: RefCell::default(),
+            resources: RefCell::default(),
+            loaded_resource_indexes: RefCell::default(),
+            types: RefCell::default(),
+        };
+        (root, state)
+    }
+
+    #[test]
+    fn publication_releases_kfc_cursor_before_replacing_live_files() {
+        let (root, state) = fixture();
+        let content = state.create_content(b"new-content").unwrap();
+        state.take_writer().unwrap().finalize().unwrap();
+        state.commit_assets().unwrap();
+        let mut published = KFCReader::new(&root, "game")
+            .unwrap()
+            .into_cursor()
+            .unwrap();
+        assert_eq!(
+            published.read_content(&content).unwrap().unwrap(),
+            b"new-content"
+        );
+        assert!(!shroudforge_game_assets::transaction::directory(&root, "game").exists());
+        drop(published);
+        drop(state);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abort_releases_staged_writer_before_removing_stage() {
+        let (root, state) = fixture();
+        let original = fs::read(root.join("game.kfc")).unwrap();
+        state.create_content(b"unpublished-content").unwrap();
+        drop(state);
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), original);
+        assert!(!shroudforge_game_assets::transaction::directory(&root, "game").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abort_releases_cursor_before_recovering_interrupted_publication() {
+        let (root, state) = fixture();
+        let original = fs::read(root.join("game.kfc")).unwrap();
+        let stage = shroudforge_game_assets::transaction::directory(&root, "game");
+        let mut records = Vec::new();
+        for extension in ["kfc_resources", "kfc"] {
+            let name = format!("game.{extension}");
+            fs::copy(root.join(&name), stage.join(format!("{name}.rollback"))).unwrap();
+            records.push((name, true));
+        }
+        fs::write(
+            stage.join("pending.json"),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("game.kfc"), b"interrupted-index").unwrap();
+        drop(state);
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), original);
+        assert!(!shroudforge_game_assets::transaction::directory(&root, "game").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

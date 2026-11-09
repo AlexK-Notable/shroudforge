@@ -56,10 +56,19 @@ fn clean(stage: &Path) -> io::Result<()> {
 }
 
 fn replace(source: &Path, target: &Path) -> io::Result<()> {
-    if target.exists() {
-        fs::remove_file(target)?;
-    }
-    fs::rename(source, target)
+    // Removing first leaves an open Windows file delete-pending and prevents
+    // reuse of its path. A single replacement also preserves the old file when
+    // publication fails, so recovery can be retried after a foreign lock closes.
+    fs::rename(source, target).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "replace asset {} from {}: {error}",
+                target.display(),
+                source.display()
+            ),
+        )
+    })
 }
 
 pub fn recover(root: &Path, stem: &str) -> io::Result<()> {
@@ -141,7 +150,12 @@ pub fn commit(root: &Path, stem: &str) -> io::Result<()> {
     })();
 
     if let Err(error) = publish {
-        recover(root, stem)?;
+        if let Err(recovery_error) = recover(root, stem) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{error}; asset recovery also failed: {recovery_error}"),
+            ));
+        }
         return Err(error);
     }
     clean(&stage)
@@ -206,6 +220,44 @@ mod tests {
             b"new-data"
         );
         assert!(!stage.exists());
+        remove_fixture(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blocked_publication_preserves_live_file_and_can_recover_after_handle_closes() {
+        let root = fixture();
+        let stage = begin(&root, "game").unwrap();
+        fs::write(stage.join("game.kfc"), b"new-index").unwrap();
+        fs::write(stage.join("game.kfc_resources"), b"new-data").unwrap();
+        // This is the same ordinary file handle retained by KFCCursor.
+        let retained = fs::File::open(root.join("game.kfc_resources")).unwrap();
+        let error = commit(&root, "game").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("game.kfc_resources"), "{error}");
+        assert_eq!(
+            fs::read(root.join("game.kfc_resources")).unwrap(),
+            b"old-data"
+        );
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), b"old-index");
+        assert!(stage.join("pending.json").is_file());
+        drop(retained);
+        recover(&root, "game").unwrap();
+        recover(&root, "game").unwrap();
+        assert_eq!(
+            fs::read(root.join("game.kfc_resources")).unwrap(),
+            b"old-data"
+        );
+        assert!(!stage.exists());
+        remove_fixture(&root);
+    }
+
+    #[test]
+    fn failed_replacement_preserves_existing_target() {
+        let root = fixture();
+        let error = replace(&root.join("missing-staged-file"), &root.join("game.kfc")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read(root.join("game.kfc")).unwrap(), b"old-index");
         remove_fixture(&root);
     }
 }
