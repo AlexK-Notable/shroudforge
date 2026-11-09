@@ -1,3 +1,4 @@
+#include "abi/runtime_host.h"
 #include "engine-hooks/scan_executable_signature.h"
 #include "engine-hooks/allocate_near_code.h"
 #include "engine-hooks/encode_relative_jump.h"
@@ -26,8 +27,13 @@ struct InstalledHook {
     std::uintptr_t target{};
     void* payload{};
     std::vector<std::uint8_t> original;
+    // Kiln fork: a hook placed by the host (abi/runtime_host.h) has a handle and no payload or original bytes here.
+    std::uint64_t host_handle{};
+    void(KFC_RUNTIME_CALL* host_remove)(std::uint64_t){};
 };
 std::vector<InstalledHook> hooks;
+KfcRuntimeHost host{};
+bool host_offered{};
 
 bool supported_image(std::uint8_t*& base, std::size_t& size) {
     base = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(nullptr));
@@ -122,10 +128,35 @@ std::vector<std::uint8_t> context_callback_code(void* callback) {
     return code;
 }
 
-bool install_hook(std::uint8_t* base, std::string_view signature,
+// Kiln fork: with a host (KfcRuntimeSetHost) the host finds the place in the exe file's bytes and places the hook in its
+// own chain. The live bytes are not compared: another module's jump at the place is the host's business.
+bool install_host_hook(const char* name, std::string_view signature, const std::uint8_t* original,
+                       std::size_t original_size, void* callback, std::uint32_t kind, std::uintptr_t extra) {
+    const auto fail = [](const char* reason) { initialization_error = reason; return false; };
+    if (!original || original_size < 5) return fail("invalid-overwrite-length");
+    const std::string text(signature);
+    std::uintptr_t target{};
+    switch (host.find_signature(text.c_str(), original, original_size, &target)) {
+    case KFC_HOST_FOUND: break;
+    case KFC_HOST_MISMATCH: return fail("original-bytes-mismatch");
+    case KFC_HOST_UNAVAILABLE: return fail("host-signature-search-unavailable");
+    default: return fail("signature-not-unique-or-missing");
+    }
+    if (!target) return fail("signature-not-unique-or-missing");
+    const auto handle = host.install_hook(name, target, kind, callback, extra);
+    if (!handle) return fail("host-hook-refused");
+    hooks.push_back(InstalledHook{target, nullptr, {}, handle, host.remove_hook});
+    return true;
+}
+
+bool install_hook(std::uint8_t* base, const char* name, std::string_view signature,
                   const std::uint8_t* original, std::size_t original_size, void* callback,
                   bool cursor_callback = false, bool context_callback = false) {
     const auto fail = [](const char* reason) { initialization_error = reason; return false; };
+    if (host_offered)
+        return install_host_hook(name, signature, original, original_size, callback,
+            cursor_callback ? KFC_HOST_HOOK_CURSOR : context_callback ? KFC_HOST_HOOK_CONTEXT : KFC_HOST_HOOK_PLAIN,
+            cursor_callback ? KfcRuntimeCompatibility::EnshroudedClient::world_cursor_capture_offset : 0);
     if (!original || original_size < 5) return fail("invalid-overwrite-length");
     const auto match = EngineHooks::FindExecutableSignature(base, signature, 2);
     const auto target = match.count == 1 ? match.address : 0;
@@ -173,6 +204,22 @@ bool install_hook(std::uint8_t* base, std::string_view signature,
 }
 
 namespace EngineHooks {
+// Kiln fork (abi/runtime_host.h). A refused table leaves the previous state alone.
+bool SetHost(const KfcRuntimeHost* offered) {
+    if (!offered) { host = {}; host_offered = false; return true; }
+    const auto required = offsetof(KfcRuntimeHost, remove_hook) + sizeof(offered->remove_hook);
+    if (offered->size < required || offered->version < KFC_RUNTIME_HOST_VERSION ||
+        !offered->find_signature || !offered->install_hook || !offered->remove_hook) return false;
+    host = {};
+    host.size = sizeof(host);
+    host.version = KFC_RUNTIME_HOST_VERSION;
+    host.find_signature = offered->find_signature;
+    host.install_hook = offered->install_hook;
+    host.remove_hook = offered->remove_hook;
+    host_offered = true;
+    return true;
+}
+
 bool Install() {
     if (!hooks.empty()) return accepting.load(std::memory_order_acquire);
     // Published trampolines and their callbacks remain mapped until process exit.
@@ -186,7 +233,7 @@ bool Install() {
     // Drain on the actor-world update entry, which continues while the local
     // actor is active. The prop-system callback is event-driven and can stop
     // being called for long stretches, leaving queued ECS work permanently stale.
-    if (!install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::game_thread_signature,
+    if (!install_hook(base, "game_thread", KfcRuntimeCompatibility::EnshroudedClient::game_thread_signature,
             KfcRuntimeCompatibility::EnshroudedClient::game_thread_original.data(),
             KfcRuntimeCompatibility::EnshroudedClient::game_thread_original.size(),
             reinterpret_cast<void*>(&drain))) {
@@ -194,7 +241,7 @@ bool Install() {
         Uninstall();
         return false;
     }
-    if (!install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::entity_manager_signature,
+    if (!install_hook(base, "entity_manager", KfcRuntimeCompatibility::EnshroudedClient::entity_manager_signature,
             KfcRuntimeCompatibility::EnshroudedClient::entity_manager_original.data(),
             KfcRuntimeCompatibility::EnshroudedClient::entity_manager_original.size(),
             reinterpret_cast<void*>(&capture_entity_manager))) {
@@ -202,22 +249,22 @@ bool Install() {
         Uninstall();
         return false;
     }
-    const bool prop_hook = install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::world_prop_update_signature,
+    const bool prop_hook = install_hook(base, "world_prop_update", KfcRuntimeCompatibility::EnshroudedClient::world_prop_update_signature,
         KfcRuntimeCompatibility::EnshroudedClient::world_prop_update_original.data(),
         KfcRuntimeCompatibility::EnshroudedClient::world_prop_update_original.size(),
         reinterpret_cast<void*>(&WorldRuntime::OnPropUpdate));
-    const bool placement_hook = install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::world_actor_placement_signature,
+    const bool placement_hook = install_hook(base, "world_actor_placement", KfcRuntimeCompatibility::EnshroudedClient::world_actor_placement_signature,
         KfcRuntimeCompatibility::EnshroudedClient::world_actor_placement_original.data(),
         KfcRuntimeCompatibility::EnshroudedClient::world_actor_placement_original.size(),
         reinterpret_cast<void*>(&WorldRuntime::OnActorPlacement));
     const bool building_dispatch_hook = !KfcRuntimeCompatibility::EnshroudedClient::world_building_dispatch_signature.empty() &&
-        install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::world_building_dispatch_signature,
+        install_hook(base, "world_building_dispatch", KfcRuntimeCompatibility::EnshroudedClient::world_building_dispatch_signature,
             KfcRuntimeCompatibility::EnshroudedClient::world_building_dispatch_original.data(),
             KfcRuntimeCompatibility::EnshroudedClient::world_building_dispatch_original.size(),
             reinterpret_cast<void*>(&WorldRuntime::OnBuildingDispatch), false, true);
     entity_context_hooks_ready.store(prop_hook && placement_hook && building_dispatch_hook, std::memory_order_release);
     const bool cursor_hook = !KfcRuntimeCompatibility::EnshroudedClient::world_cursor_signature.empty() &&
-        install_hook(base, KfcRuntimeCompatibility::EnshroudedClient::world_cursor_signature,
+        install_hook(base, "world_cursor", KfcRuntimeCompatibility::EnshroudedClient::world_cursor_signature,
         KfcRuntimeCompatibility::EnshroudedClient::world_cursor_original.data(),
         KfcRuntimeCompatibility::EnshroudedClient::world_cursor_original.size(),
         reinterpret_cast<void*>(&WorldRuntime::OnCursorUpdate), true);
@@ -234,6 +281,12 @@ void Uninstall() {
     entity_context_hooks_ready.store(false, std::memory_order_release);
     WorldRuntime::SetCursorHookReady(false);
     for (auto iterator = hooks.rbegin(); iterator != hooks.rend(); ++iterator) {
+        if (iterator->host_handle) {
+            // Kiln fork: the host's chain forwards a removed link, so a thread still inside it is safe.
+            if (iterator->host_remove) iterator->host_remove(iterator->host_handle);
+            iterator->target = 0;
+            continue;
+        }
         if (iterator->target && iterator->original.size() &&
             EngineHooks::WriteExecutableBytes(iterator->target, iterator->original.data(), iterator->original.size()))
             iterator->target = 0;
@@ -246,4 +299,8 @@ void Uninstall() {
     command_observed.store(false, std::memory_order_release);
     CancelPendingOperations();
 }
+}
+
+extern "C" KFC_RUNTIME_API bool KFC_RUNTIME_CALL KfcRuntimeSetHost(const KfcRuntimeHost* host) {
+    return EngineHooks::SetHost(host);
 }

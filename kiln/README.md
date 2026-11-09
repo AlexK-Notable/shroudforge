@@ -26,6 +26,23 @@ C functions. With a setting, it drives the player's installed ShroudForge instea
 `winmm.dll` bootstrap calls. If upstream changes them, `kiln-shroudforge` (in Kiln) must follow, and
 `sync-upstream.sh` fails loudly.
 
+## Engine hooks through the host (dev.21)
+
+`kfc-runtime.dll` hooks up to six places in the game's code (the profile's `hooks`: game_thread, entity_manager,
+world_prop_update, world_actor_placement, world_building_dispatch, world_cursor). Alone it scans the live code and
+refuses a place whose bytes another DLL already changed. A host that owns the game's hooks can offer a table before
+`KfcRuntimeInitialize`:
+
+```
+KfcRuntimeSetHost(const KfcRuntimeHost*)   // modules/game-runtime/native/abi/runtime_host.h, optional export
+```
+
+`find_signature` looks in the exe file's bytes and checks the profile's original bytes there, `install_hook` places the
+hook (the callback gets the registers of its kind), `remove_hook` takes it away. Kiln's `kiln-shroudforge.dll` does this
+with `kiln.hooks` v2. A host that never calls it, such as ShroudForge's own `winmm.dll` bootstrap, gets the behaviour of
+upstream unchanged. Test: `cmake --build <dir> --target kfc-runtime-test-engine-hooks`, then run
+`bin/kfc-runtime-test-engine-hooks.exe` under Wine (`kiln/native/tests/`).
+
 ## Merging upstream
 
 ```
