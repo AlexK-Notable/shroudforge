@@ -9,14 +9,16 @@
 //! nothing changes.
 //!
 //! The functions are exported from `shroudforge-runtime.dll` and declared for
-//! C in `kiln/abi/input_host.h`. Any thread may call them. A host calls
-//! `begin` before `shroudforge_create`.
+//! C in `kiln/abi/input_host.h`. Any thread may call them: one call runs at a
+//! time. A host calls `begin` before `shroudforge_create`.
 
-use crate::observe_keyboard::{host_begin, host_end, host_key, host_mouse_button, host_reset};
+use crate::observe_keyboard::{
+    host_begin, host_end, host_key, host_key_is_down, host_mouse_button, host_reset,
+};
 use std::{
     ffi::{CStr, c_char},
     panic::catch_unwind,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 unsafe extern "C" {
@@ -35,8 +37,22 @@ unsafe extern "C" {
 const INPUT_HOST_VERSION: u32 = 1;
 /// RI_KEY_BREAK of RAWKEYBOARD.Flags: the key was released.
 const RAW_KEY_BREAK: u32 = 1;
+const SDL_SCANCODE_PRINTSCREEN: u16 = 70;
 
-static PENDING_E1: AtomicBool = AtomicBool::new(false);
+/// What one call leaves for the next. Every function below holds this lock
+/// for its whole turn, so two threads cannot interleave their steps: a
+/// modifier that one of them recorded would otherwise be overwritten with the
+/// other's older view. The mods' queries never take it.
+struct Feed {
+    /// The E1 prefix of Pause, from one raw record to the next.
+    pending_e1: bool,
+}
+
+static FEED: Mutex<Feed> = Mutex::new(Feed { pending_e1: false });
+
+fn feed() -> MutexGuard<'static, Feed> {
+    FEED.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_version() -> u32 {
@@ -48,7 +64,8 @@ pub extern "C" fn shroudforge_input_host_version() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_begin() -> u32 {
     catch_unwind(|| {
-        PENDING_E1.store(false, Ordering::Release);
+        let mut feed = feed();
+        feed.pending_e1 = false;
         u32::from(host_begin())
     })
     .unwrap_or(0)
@@ -59,10 +76,11 @@ pub extern "C" fn shroudforge_input_host_begin() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_raw_key(make_code: u32, flags: u32, vkey: u32) {
     let _ = catch_unwind(|| {
-        let mut pending_e1 = i32::from(PENDING_E1.load(Ordering::Acquire));
+        let mut feed = feed();
+        let mut pending_e1 = i32::from(feed.pending_e1);
         let scancode =
             unsafe { sf_host_keyboard_raw_scancode(make_code, flags, vkey, &mut pending_e1) };
-        PENDING_E1.store(pending_e1 != 0, Ordering::Release);
+        feed.pending_e1 = pending_e1 != 0;
         if let Ok(scancode) = u16::try_from(scancode) {
             host_key(scancode, flags & RAW_KEY_BREAK == 0);
         }
@@ -75,9 +93,16 @@ pub extern "C" fn shroudforge_input_host_raw_key(make_code: u32, flags: u32, vke
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_window_key(wparam: usize, lparam: isize) {
     let _ = catch_unwind(|| {
+        let _feed = feed();
         let scancode = unsafe { sf_host_keyboard_message_scancode(wparam, lparam) };
         if let Ok(scancode) = u16::try_from(scancode) {
-            host_key(scancode, lparam & (1 << 31) == 0);
+            let down = lparam & (1 << 31) == 0;
+            // Windows sends a window only the release of Print Screen. As SDL
+            // does for its own window, count the press that never arrived.
+            if scancode == SDL_SCANCODE_PRINTSCREEN && !down && !host_key_is_down(scancode) {
+                host_key(scancode, true);
+            }
+            host_key(scancode, down);
         }
     });
 }
@@ -86,6 +111,7 @@ pub extern "C" fn shroudforge_input_host_window_key(wparam: usize, lparam: isize
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_mouse_button(button: u32, down: u32) {
     let _ = catch_unwind(|| {
+        let _feed = feed();
         if let Ok(button) = u8::try_from(button) {
             host_mouse_button(button, down != 0);
         }
@@ -97,7 +123,8 @@ pub extern "C" fn shroudforge_input_host_mouse_button(button: u32, down: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_reset() {
     let _ = catch_unwind(|| {
-        PENDING_E1.store(false, Ordering::Release);
+        let mut feed = feed();
+        feed.pending_e1 = false;
         host_reset();
     });
 }
@@ -105,7 +132,10 @@ pub extern "C" fn shroudforge_input_host_reset() {
 /// The host stops feeding. Shortcut queries answer "not held" afterwards.
 #[unsafe(no_mangle)]
 pub extern "C" fn shroudforge_input_host_end() {
-    let _ = catch_unwind(host_end);
+    let _ = catch_unwind(|| {
+        let _feed = feed();
+        host_end();
+    });
 }
 
 /// Key names by SDL scancode, as the helper process sends them.
@@ -233,6 +263,38 @@ mod tests {
         shroudforge_input_host_raw_key(0x43, 0, 0);
         assert!(is_hotkey_down(&f9), "the Shift held before the focus loss is forgotten");
 
+        // Print Screen in window messages: Windows sends its release only.
+        let print_screen = key("SDL:70");
+        let before = hotkey_press_revision(&print_screen);
+        shroudforge_input_host_window_key(0x2c, KEY_UP | 1 | 0x37 << 16 | 1 << 24);
+        let pressed_once = hotkey_press_revision(&print_screen);
+        assert!(pressed_once > before, "the release alone counts as one press");
+        assert!(!is_hotkey_down(&print_screen));
+        // Through raw input both arrive, and the release adds no second press.
+        shroudforge_input_host_raw_key(0x37, E0, 0x2c);
+        let pressed_twice = hotkey_press_revision(&print_screen);
+        assert!(pressed_twice > pressed_once);
+        shroudforge_input_host_window_key(0x2c, KEY_UP | 1 | 0x37 << 16 | 1 << 24);
+        assert_eq!(hotkey_press_revision(&print_screen), pressed_twice);
+
+        // Two threads: whatever the order, both modifiers are held at the end.
+        shroudforge_input_host_reset();
+        let hammer = |make_code: u32| {
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    shroudforge_input_host_raw_key(make_code, 0, 0);
+                    shroudforge_input_host_raw_key(make_code, UP, 0);
+                }
+                shroudforge_input_host_raw_key(make_code, 0, 0);
+            })
+        };
+        let (ctrl, shift) = (hammer(0x1d), hammer(0x2a));
+        ctrl.join().unwrap();
+        shift.join().unwrap();
+        assert_eq!(crate::observe_keyboard::host_modifiers(), 1 | 4, "Ctrl and Shift");
+
+        let last_press = hotkey_press_revision(&f9);
+        assert!(last_press > 0);
         shroudforge_input_host_end();
         assert!(!is_hotkey_down(&f9));
         assert_eq!(hotkey_press_revision(&f9), 0);
@@ -242,8 +304,14 @@ mod tests {
 
         assert_eq!(shroudforge_input_host_begin(), 1, "a host may begin again");
         assert!(!is_hotkey_down(&f9), "a new feed starts with nothing held");
+        assert_eq!(
+            hotkey_press_revision(&f9),
+            0,
+            "a press from before the end is not a new press: a mod that asked in between saw 0"
+        );
         shroudforge_input_host_raw_key(0x43, 0, 0);
         assert!(is_hotkey_down(&f9));
+        assert!(hotkey_press_revision(&f9) > last_press, "a new press is newer than any before");
         shroudforge_input_host_end();
     }
 }

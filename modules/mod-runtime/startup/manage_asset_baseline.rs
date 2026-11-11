@@ -1,5 +1,25 @@
 use super::*;
 use kfc::container::KFCFile;
+
+/// Kiln layer: a backup gets its name only when its copy is complete. Restore
+/// takes any file under the backup's name for a whole one, and the companion
+/// is some 200 MiB: a start that ended during a direct copy left a part of it
+/// under that name, and a later start copied that part over the game's file.
+/// An unfinished copy now stays under `<backup>.partial`, which nothing reads.
+fn copy_complete(
+    source: impl AsRef<std::path::Path>,
+    backup: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    let backup = backup.as_ref();
+    let partial = std::path::PathBuf::from(format!("{}.partial", backup.display()));
+    std::fs::copy(source, &partial)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&partial)?
+        .sync_all()?;
+    std::fs::rename(&partial, backup)
+}
+
 pub fn create_backup(kfc_path: impl AsRef<Path>) -> Result<PathBuf, ()> {
     let path = kfc_path.as_ref();
     let mut bak_path = path.to_string();
@@ -32,7 +52,7 @@ pub fn create_backup(kfc_path: impl AsRef<Path>) -> Result<PathBuf, ()> {
     }
 
     if !bak_path.exists() {
-        if let Err(e) = std::fs::copy(path, bak_path) {
+        if let Err(e) = copy_complete(path, bak_path) {
             error!(
                 path = ?bak_path,
                 error = %e,
@@ -114,7 +134,7 @@ pub fn create_companion_backup(
         error!(path = ?backup, "Companion backup path is not a file");
         return Err(());
     }
-    std::fs::copy(path, &backup).map_err(|error| {
+    copy_complete(path, &backup).map_err(|error| {
         error!(path = ?path, backup_path = ?backup, error = %error, "Failed to create companion backup");
     })?;
     info!(path = ?path, backup_path = ?backup, "Companion backup created");
@@ -158,6 +178,30 @@ mod companion_backup_tests {
 
         assert!(restore_companion_backup(&resource).unwrap());
         assert_eq!(std::fs::read(&resource).unwrap(), b"original resources");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Kiln layer.
+    #[test]
+    fn an_unfinished_backup_copy_is_never_restored() {
+        let root = std::env::temp_dir().join(format!(
+            "shroudforge-resource-backup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let resource = root.join("enshrouded_server.kfc_resources");
+        let backup = root.join("enshrouded_server.kfc_resources.bak");
+        let partial = root.join("enshrouded_server.kfc_resources.bak.partial");
+        std::fs::write(&resource, b"original resources").unwrap();
+        // What a start leaves that ended during the copy.
+        std::fs::write(&partial, b"origin").unwrap();
+
+        assert!(!restore_companion_backup(&resource).unwrap(), "there is no backup yet");
+        assert_eq!(std::fs::read(&resource).unwrap(), b"original resources");
+
+        create_companion_backup(&resource).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"original resources");
+        assert!(!partial.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

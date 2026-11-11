@@ -63,8 +63,8 @@ shroudforge_input_host_end()
 They are optional exports of `shroudforge-runtime.dll`, declared with the host's rules in `kiln/abi/input_host.h`
 (code in `modules/hotkeys/host_input.rs` and `host_keyboard.c`). Keys are translated with SDL's own Windows scan-code
 table, so a key gets the `SDL:<n>` code that ShroudForge's settings store. While a host feeds, the runtime starts
-neither the helper process nor SDL input. Key names for `shroudforge.input.keybind_label` come from the system
-keyboard layout. A host that never calls `begin`, such as ShroudForge's own `winmm.dll` bootstrap, gets the behaviour
+neither the helper process nor SDL input. Calls run one at a time, from any thread. Key names for
+`shroudforge.input.keybind_label` come from the system keyboard layout. A host that never calls `begin`, such as ShroudForge's own `winmm.dll` bootstrap, gets the behaviour
 of upstream unchanged. `kiln/build.sh` fails when the built DLL lacks one of these exports; `kiln/check-contract.py`
 compares the Rust definitions with the header. Tests: `cargo xwin test -p shroudforge-hotkeys --target
 x86_64-pc-windows-msvc` with Wine as the runner (no game, no window).
@@ -89,7 +89,10 @@ upstream does: new backups from the current game files, then the patch. Details
 - The header backup moves last. A start after an interrupted move still sees an outdated header backup and continues
   in the same folder. The other order could leave an old companion beside a new header backup.
 - Only the newest generation is kept.
-- Links and anything that is not a regular file or folder are refused before a file moves.
+- The backups, the seal and the folders from `<game>/shroudforge` down must be regular files and folders; a link
+  among them is refused before a file moves. The game folder itself and what lies above it are not judged.
+- A new backup appears under its name only when its copy is complete (`<name>.partial` until then), so a start that
+  ends during the copy of the 200 MiB resource file cannot leave a half backup that a later start restores from.
 
 With a ShroudForge installation in the game folder nothing changes: its Updater and recycle bin are used, and a
 missing Updater is still an error. Tests: `cargo test -p shroudforge-game-assets` (host, also under Wine) and

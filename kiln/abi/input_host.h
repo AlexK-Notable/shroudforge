@@ -18,7 +18,10 @@
  *    arrives twice is counted once.
  *  - Call shroudforge_input_host_reset when the game window loses the keyboard focus (WM_KILLFOCUS, or
  *    WM_ACTIVATEAPP with wParam 0). The window does not get the releases of keys held at that moment.
- *  - Any thread may call these functions. They take short locks, do not block and do not call back.
+ *  - Any thread may call these functions. The runtime runs one call at a time and holds only short locks of its
+ *    own; it does not wait for the game or for a mod, and it does not call back.
+ *  - Print Screen: Windows sends a window only its release. shroudforge_input_host_window_key counts the missing
+ *    press itself, as SDL does.
  *  - Key codes are translated with SDL's own Windows scan-code table, so a key gets the SDL:<n> code that
  *    ShroudForge's settings store for it.
  *

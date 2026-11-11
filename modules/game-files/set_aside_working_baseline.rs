@@ -92,6 +92,14 @@ pub fn set_aside_without_updater(root: &Path, stem: &str) -> Option<Result<PathB
 /// out of the game folder and returns the folder that holds them now. Nothing
 /// is moved when one of the files or folders involved is not what it should be.
 pub fn set_aside(root: &Path, stem: &str) -> Result<PathBuf, String> {
+    set_aside_with(root, stem, |from, to| fs::rename(from, to))
+}
+
+fn set_aside_with(
+    root: &Path,
+    stem: &str,
+    mut move_file: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<PathBuf, String> {
     if !matches!(stem, "enshrouded" | "enshrouded_server") {
         return Err("unknown game target for the working asset backups".into());
     }
@@ -124,11 +132,23 @@ pub fn set_aside(root: &Path, stem: &str) -> Result<PathBuf, String> {
         }
         folder(&kept)?;
         fs::create_dir_all(&kept)?;
-        for name in &found {
-            file(&kept.join(name))?;
+        let mut inside = Vec::new();
+        for name in &names {
+            if file(&kept.join(name))?.is_some() {
+                inside.push(name);
+            }
+        }
+        // The header backup arrives last, so a folder that holds one is a
+        // finished generation: another pair with the same size and time. It is
+        // replaced whole; its seal must not end up beside this pair. Without a
+        // header backup the folder is this pair's own interrupted move.
+        if inside.contains(&&names[2]) {
+            for name in inside {
+                fs::remove_file(kept.join(name))?;
+            }
         }
         for name in found {
-            fs::rename(root.join(name), kept.join(name))?;
+            move_file(&root.join(name), &kept.join(name))?;
         }
         // The pair is out of the game folder; what follows is housekeeping.
         if let Some(generations) = kept.parent().and_then(|parent| fs::read_dir(parent).ok()) {
@@ -244,21 +264,30 @@ mod tests {
             ("enshrouded_server.kfc_resources.bak", "resources"),
             ("enshrouded_server.kfc.bak.integrity", "seal"),
         ]);
-        // What a call leaves when the process ends before the header backup moved.
-        let header = fs::metadata(root.join("enshrouded_server.kfc.bak")).unwrap();
-        let kept = root
-            .join("shroudforge/backups")
-            .join(FOLDER)
-            .join("enshrouded_server")
-            .join(format!(
-                "{}-{}",
-                header.len(),
-                header.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs()
-            ));
-        fs::create_dir_all(&kept).unwrap();
-        for name in ["enshrouded_server.kfc_resources.bak", "enshrouded_server.kfc.bak.integrity"] {
-            fs::rename(root.join(name), kept.join(name)).unwrap();
+        // The move stops after each file in turn. The header backup must be
+        // the one still in the game folder: it is what brings the next start
+        // back here.
+        for (moved_so_far, moves_this_time) in [(0, 0), (0, 1), (1, 1)] {
+            let mut moves = 0;
+            let error = set_aside_with(&root, "enshrouded_server", |from, to| {
+                if moves == moves_this_time {
+                    return Err(io::Error::other("the process ended here"));
+                }
+                moves += 1;
+                fs::rename(from, to)
+            })
+            .unwrap_err();
+            assert!(error.contains("the process ended here"), "{error}");
+            assert_eq!(
+                fs::read_to_string(root.join("enshrouded_server.kfc.bak")).unwrap(),
+                "header",
+                "after {} moves",
+                moved_so_far + moves_this_time
+            );
         }
+        assert!(!root.join("enshrouded_server.kfc_resources.bak").exists());
+        assert!(!root.join("enshrouded_server.kfc.bak.integrity").exists());
+        let kept = generations(&root, "enshrouded_server").pop().unwrap();
 
         assert_eq!(set_aside(&root, "enshrouded_server").unwrap(), kept);
         assert_eq!(
@@ -270,6 +299,37 @@ mod tests {
             ])
         );
         assert!(!root.join("enshrouded_server.kfc.bak").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_finished_generation_of_the_same_name_is_replaced_not_mixed() {
+        let root = fixture(&[
+            ("enshrouded.kfc.bak", "header 1"),
+            ("enshrouded.kfc_resources.bak", "resources 1"),
+            ("enshrouded.kfc.bak.integrity", "seal 1"),
+        ]);
+        let time = fs::metadata(root.join("enshrouded.kfc.bak")).unwrap().modified().unwrap();
+        let first = set_aside(&root, "enshrouded").unwrap();
+
+        // Another pair whose header backup has the same size and time, and no seal.
+        fs::write(root.join("enshrouded.kfc.bak"), "header 2").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(root.join("enshrouded.kfc.bak"))
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        fs::write(root.join("enshrouded.kfc_resources.bak"), "resources 2").unwrap();
+        assert_eq!(set_aside(&root, "enshrouded").unwrap(), first);
+        assert_eq!(
+            files(&first),
+            list(&[
+                ("enshrouded.kfc.bak", "header 2"),
+                ("enshrouded.kfc_resources.bak", "resources 2"),
+            ]),
+            "the first pair's seal does not stay beside the second pair"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

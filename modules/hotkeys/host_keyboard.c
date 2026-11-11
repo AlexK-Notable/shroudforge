@@ -23,6 +23,10 @@ static int scancode_at(unsigned index)
  * Returns 0 for a prefix record and for a record that names no key. */
 int sf_host_keyboard_raw_scancode(unsigned make_code, unsigned flags, unsigned vkey, int *pending_e1)
 {
+    /* The three fields are 16 bits wide in RAWKEYBOARD. */
+    make_code &= 0xffff;
+    flags &= 0xffff;
+    vkey &= 0xffff;
     if (flags & RI_KEY_E1) {
         *pending_e1 = 1;
         return SDL_SCANCODE_UNKNOWN;
@@ -33,10 +37,14 @@ int sf_host_keyboard_raw_scancode(unsigned make_code, unsigned flags, unsigned v
     if (!make_code) return SDL_SCANCODE_UNKNOWN;
     if (*pending_e1) {
         *pending_e1 = 0;
-        return LOBYTE(make_code) == 0x45 ? SDL_SCANCODE_PAUSE : SDL_SCANCODE_UNKNOWN;
+        return make_code == 0x45 ? SDL_SCANCODE_PAUSE : SDL_SCANCODE_UNKNOWN;
     }
+    /* As in SDL, only the record's own E0 flag marks an extended key, also
+     * when the make code came from the virtual key above with an 0xE0 high
+     * byte. The helper process reports such a key the same way, and the code
+     * here has to be the one the helper reports. */
     unsigned index = LOBYTE(make_code);
-    if ((flags & RI_KEY_E0) || HIBYTE(make_code) == 0xe0) index |= 0x80;
+    if (flags & RI_KEY_E0) index |= 0x80;
     return scancode_at(index);
 }
 

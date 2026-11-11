@@ -157,7 +157,11 @@ pub(crate) fn mouse_label(button: u8) -> String {
 // Kiln layer: a host that owns the game window's input feeds the shortcut
 // state itself (host_input.rs).
 #[cfg(windows)]
-pub(crate) use windows::{host_begin, host_end, host_key, host_mouse_button, host_reset};
+pub(crate) use windows::{
+    host_begin, host_end, host_key, host_key_is_down, host_mouse_button, host_reset,
+};
+#[cfg(all(windows, test))]
+pub(crate) use windows::host_modifiers;
 
 #[cfg(windows)]
 mod windows {
@@ -706,7 +710,8 @@ mod windows {
     }
 
     // Kiln layer: the host feed. SDL scancodes come from host_input.rs, which
-    // translates the game window's own key records with SDL's table.
+    // translates the game window's own key records with SDL's table and runs
+    // one call at a time: these functions read a state and then write it.
 
     /// The host takes over the shortcut state. False while ShroudForge's own
     /// reader (in-process SDL or the helper process) is feeding it.
@@ -716,6 +721,7 @@ mod windows {
         }
         HOST.store(true, Ordering::Release);
         host_clear();
+        host_forget_presses();
         ACTIVE.store(true, Ordering::Release);
         record(KeyboardMessage::Labels(crate::host_input::labels()));
         tracing::info!(target: "shroudforge::hotkeys", "Keyboard and mouse input is fed by the host");
@@ -779,6 +785,27 @@ mod windows {
         if HOST.load(Ordering::Acquire) {
             ACTIVE.store(false, Ordering::Release);
             host_clear();
+            host_forget_presses();
+        }
+    }
+
+    /// Whether the feed has this key as held (a press without its release).
+    pub(crate) fn host_key_is_down(scancode: u16) -> bool {
+        KEYS.read()
+            .is_ok_and(|keys| keys.contains_key(&Trigger::Keyboard(scancode)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_modifiers() -> u8 {
+        MODIFIERS.load(Ordering::Acquire)
+    }
+
+    /// A press from before the feed ended must not count as a new one when
+    /// the feed begins again: a mod that asked in between has seen revision 0.
+    /// The sequence keeps counting, so a later press is newer than any before.
+    fn host_forget_presses() {
+        if let Ok(mut presses) = PRESS_REVISIONS.write() {
+            presses.clear();
         }
     }
 
