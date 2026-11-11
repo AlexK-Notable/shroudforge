@@ -5,6 +5,9 @@ mod pregame;
 mod start_updater_controller;
 #[cfg(test)]
 mod tests;
+// Kiln layer: tests of the paths only a host-bundled runtime takes.
+#[cfg(test)]
+mod kiln_tests;
 
 use shroudforge_api::{IngameRuntime, ShroudForgeApi};
 use std::any::Any;
@@ -99,6 +102,16 @@ pub(crate) fn recycle_incompatible_game_asset_backups(
             "command": "recycle-game-asset-backups",
             "target": target,
         });
+        // Kiln layer: a runtime that a host bundles has no Updater. The outdated
+        // pair is then set aside in ShroudForge's backups folder instead.
+        if let Some(result) =
+            shroudforge_game_assets::working_baseline::set_aside_without_updater(root, target)
+        {
+            let folder = result?;
+            tracing::warn!(target: "shroudforge::startup", target = target, folder = %folder.display(),
+                "No ShroudForge Updater is installed: the outdated working asset backups were set aside in ShroudForge's backups folder, not in the recycle bin");
+            return Ok(());
+        }
         let executable = shroudforge_loader_config::paths::updater_executable(root);
         if !executable.is_file() {
             return Err(

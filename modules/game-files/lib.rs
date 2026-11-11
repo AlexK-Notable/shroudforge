@@ -5,4 +5,7 @@ mod read_game_file_status;
 mod request_game_file_restore;
 #[path = "game_file_transaction.rs"]
 pub mod transaction;
+// Kiln layer: replaces an outdated working baseline where no Updater exists.
+#[path = "set_aside_working_baseline.rs"]
+pub mod working_baseline;
 pub use request_game_file_restore::*;

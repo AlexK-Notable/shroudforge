@@ -69,6 +69,32 @@ of upstream unchanged. `kiln/build.sh` fails when the built DLL lacks one of the
 compares the Rust definitions with the header. Tests: `cargo xwin test -p shroudforge-hotkeys --target
 x86_64-pc-windows-msvc` with Wine as the runner (no game, no window).
 
+## Game updates without the Updater (dev.24)
+
+ShroudForge patches the game archives from working backups, `<stem>.kfc.bak` and `<stem>.kfc_resources.bak`. After a
+game update those belong to the previous game version. ShroudForge then has `shroudforge-updater.exe` move them to its
+recycle bin and captures new ones from the updated game files. Kiln's bundled component has no Updater, so that step
+failed with "ShroudForge Updater is unavailable", asset preparation failed on every start after a game update, and
+asset mods stayed off until someone deleted the backups by hand.
+
+In a game folder with no ShroudForge installation (neither `shroudforge/shroudforge-updater.exe` nor
+`shroudforge/shroudforge-runtime.dll`), the runtime now moves the outdated pair itself, to
+`<game>/shroudforge/backups/outdated-working-baseline/<stem>/<size>-<mtime of the header backup>/`, and goes on as
+upstream does: new backups from the current game files, then the patch. Details
+(`modules/game-files/set_aside_working_baseline.rs`):
+
+- kiln-eml's seal `<stem>.kfc.bak.integrity` moves with the pair it describes. Left behind, it would no longer match
+  the new pair and kiln-eml would refuse the pair. kiln-eml treats an unsealed pair by its own rule: it compares the
+  backup with the live resource file and seals the pair when they agree.
+- The header backup moves last. A start after an interrupted move still sees an outdated header backup and continues
+  in the same folder. The other order could leave an old companion beside a new header backup.
+- Only the newest generation is kept.
+- Links and anything that is not a regular file or folder are refused before a file moves.
+
+With a ShroudForge installation in the game folder nothing changes: its Updater and recycle bin are used, and a
+missing Updater is still an error. Tests: `cargo test -p shroudforge-game-assets` (host, also under Wine) and
+`outdated_working_backups_are_replaced_without_an_updater` in `shroudforge-modloader` (Wine).
+
 ## Merging upstream
 
 ```
