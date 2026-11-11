@@ -36,3 +36,10 @@ target_compile_features(kfc-runtime-test-engine-hooks PRIVATE cxx_std_20)
 target_compile_definitions(kfc-runtime-test-engine-hooks PRIVATE KFC_RUNTIME_BUILD WIN32_LEAN_AND_MEAN NOMINMAX)
 set_property(TARGET kfc-runtime-test-engine-hooks PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(kfc-runtime-test-engine-hooks PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Host key feed of shroudforge-runtime.dll (../abi/input_host.h): loads a built DLL and calls every export.
+#   cmake --build <dir> --target shroudforge-runtime-test-input-host
+#   wine <dir>/bin/shroudforge-runtime-test-input-host.exe <OUT>/shroudforge/shroudforge-runtime.dll
+add_executable(shroudforge-runtime-test-input-host EXCLUDE_FROM_ALL tests/input_host_smoke_test.c)
+set_property(TARGET shroudforge-runtime-test-input-host PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(shroudforge-runtime-test-input-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

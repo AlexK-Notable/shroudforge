@@ -7,6 +7,9 @@
 //! Native UI window toggles use the shared debounce gate. Mod keybind queries
 //! continue to consume the raw press revisions.
 
+// Kiln layer: C entry points for a host that feeds the shortcut state.
+#[cfg(windows)]
+mod host_input;
 mod observe_keyboard;
 mod parse_hotkey;
 mod window_toggle_debounce;

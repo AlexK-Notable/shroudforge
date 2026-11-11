@@ -54,6 +54,15 @@ SHROUDFORGE_NO_APP_ICON=1 nice -n "$nice" cargo xwin build --release --locked -p
   --target x86_64-pc-windows-msvc
 dll=$CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/shroudforge_modloader.dll
 [[ -f $dll ]] || { echo "shroudforge_modloader.dll not built" >&2; exit 1; }
+# The functions kiln-shroudforge.dll looks up must be in the export table (the host key feed lives in a dependency
+# crate, kiln/abi/input_host.h).
+exports=$(llvm-readobj --coff-exports "$dll")
+for sym in shroudforge_prepare_startup shroudforge_create shroudforge_update shroudforge_destroy \
+    shroudforge_input_host_version shroudforge_input_host_begin shroudforge_input_host_raw_key \
+    shroudforge_input_host_window_key shroudforge_input_host_mouse_button shroudforge_input_host_reset \
+    shroudforge_input_host_end; do
+  grep -qx "  Name: $sym" <<<"$exports" || { echo "shroudforge-runtime.dll does not export $sym" >&2; exit 1; }
+done
 
 # 3. kfc-runtime.dll
 nb=$out/native

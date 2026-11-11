@@ -154,6 +154,11 @@ pub(crate) fn mouse_label(button: u8) -> String {
     format!("Mouse {button}")
 }
 
+// Kiln layer: a host that owns the game window's input feeds the shortcut
+// state itself (host_input.rs).
+#[cfg(windows)]
+pub(crate) use windows::{host_begin, host_end, host_key, host_mouse_button, host_reset};
+
 #[cfg(windows)]
 mod windows {
     use super::{Hotkey, InputDevice, Path};
@@ -294,8 +299,18 @@ mod windows {
         release_after: None,
     });
     static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+    // Kiln layer: set once a host feeds the state below (see host_begin).
+    static HOST: AtomicBool = AtomicBool::new(false);
+    static HOST_MODIFIER_KEYS: AtomicU8 = AtomicU8::new(0);
 
     pub(super) fn initialize(executable: Option<&Path>) -> Result<(), String> {
+        if HOST.load(Ordering::Acquire) {
+            return if ACTIVE.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err("The host's keyboard input has ended".into())
+            };
+        }
         INITIALIZED
             .get_or_init(|| {
                 tracing::debug!(target: "shroudforge::hotkeys", isolated = executable.is_some(), "Starting SDL keyboard and mouse input");
@@ -337,6 +352,9 @@ mod windows {
                         if let Err(error) = result {
                             tracing::error!(target: "shroudforge::hotkeys", %error, "SDL input stopped");
                             let _ = sender.send(Err(error));
+                        }
+                        if HOST.load(Ordering::Acquire) {
+                            return;
                         }
                         ACTIVE.store(false, Ordering::Release);
                         if let Ok(mut keys) = KEYS.write() {
@@ -390,6 +408,9 @@ mod windows {
                     .map_err(|error| format!("Invalid SDL input message: {error}"))?;
                 if let KeyboardMessage::Error(error) = message {
                     return Err(error);
+                }
+                if HOST.load(Ordering::Acquire) {
+                    return Err("The host feeds keyboard input".to_owned());
                 }
                 let first = !ACTIVE.load(Ordering::Acquire);
                 record(message);
@@ -682,6 +703,102 @@ mod windows {
             CloseHandle(handle);
         }
         active
+    }
+
+    // Kiln layer: the host feed. SDL scancodes come from host_input.rs, which
+    // translates the game window's own key records with SDL's table.
+
+    /// The host takes over the shortcut state. False while ShroudForge's own
+    /// reader (in-process SDL or the helper process) is feeding it.
+    pub(crate) fn host_begin() -> bool {
+        if ACTIVE.load(Ordering::Acquire) && !HOST.load(Ordering::Acquire) {
+            return false;
+        }
+        HOST.store(true, Ordering::Release);
+        host_clear();
+        ACTIVE.store(true, Ordering::Release);
+        record(KeyboardMessage::Labels(crate::host_input::labels()));
+        tracing::info!(target: "shroudforge::hotkeys", "Keyboard and mouse input is fed by the host");
+        true
+    }
+
+    pub(crate) fn host_key(scancode: u16, down: bool) {
+        if !host_feeding() || !super::valid_scancode(scancode) {
+            return;
+        }
+        // SDL_SCANCODE_LCTRL..=SDL_SCANCODE_RGUI. As in SDL's events, a
+        // modifier key counts for its own press and no longer for its release.
+        let keys = match scancode {
+            224..=231 => {
+                let bit = 1u8 << (scancode - 224);
+                if down {
+                    HOST_MODIFIER_KEYS.fetch_or(bit, Ordering::AcqRel) | bit
+                } else {
+                    HOST_MODIFIER_KEYS.fetch_and(!bit, Ordering::AcqRel) & !bit
+                }
+            }
+            _ => HOST_MODIFIER_KEYS.load(Ordering::Acquire),
+        };
+        record(KeyboardMessage::Key {
+            code: scancode,
+            device: InputDevice::Keyboard,
+            down,
+            repeat: false,
+            modifiers: host_modifier_groups(keys),
+            timestamp: unsafe { sf_keyboard_now_ns() },
+        });
+    }
+
+    /// SDL button numbers: 1 left, 2 middle, 3 right, 4 and 5 the side buttons.
+    pub(crate) fn host_mouse_button(button: u8, down: bool) {
+        if !host_feeding() || !(1..=32).contains(&button) {
+            return;
+        }
+        record(KeyboardMessage::Key {
+            code: u16::from(button),
+            device: InputDevice::Mouse,
+            down,
+            repeat: false,
+            modifiers: host_modifier_groups(HOST_MODIFIER_KEYS.load(Ordering::Acquire)),
+            timestamp: unsafe { sf_keyboard_now_ns() },
+        });
+    }
+
+    /// The game window lost the keyboard: its key releases will not arrive.
+    pub(crate) fn host_reset() {
+        if !host_feeding() {
+            return;
+        }
+        host_clear();
+        record(KeyboardMessage::Labels(crate::host_input::labels()));
+    }
+
+    /// Shortcut queries answer "not held" from here on. The helper process is
+    /// not started afterwards. host_begin may be called again.
+    pub(crate) fn host_end() {
+        if HOST.load(Ordering::Acquire) {
+            ACTIVE.store(false, Ordering::Release);
+            host_clear();
+        }
+    }
+
+    fn host_feeding() -> bool {
+        HOST.load(Ordering::Acquire) && ACTIVE.load(Ordering::Acquire)
+    }
+
+    fn host_clear() {
+        HOST_MODIFIER_KEYS.store(0, Ordering::Release);
+        MODIFIERS.store(0, Ordering::Release);
+        if let Ok(mut keys) = KEYS.write() {
+            keys.clear();
+        }
+    }
+
+    /// Bits 0..=7 are LCTRL, LSHIFT, LALT, LGUI, RCTRL, RSHIFT, RALT, RGUI.
+    /// The result uses the groups of sdl_keyboard.c: Ctrl 1, Alt 2, Shift 4, Meta 8.
+    fn host_modifier_groups(keys: u8) -> u8 {
+        let either = (keys | keys >> 4) & 0x0f;
+        (either & 1) | ((either & 4) >> 1) | ((either & 2) << 1) | (either & 8)
     }
 
     #[cfg(test)]

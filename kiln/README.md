@@ -43,6 +43,32 @@ with `kiln.hooks` v2. A host that never calls it, such as ShroudForge's own `win
 upstream unchanged. Test: `cmake --build <dir> --target kfc-runtime-test-engine-hooks`, then run
 `bin/kfc-runtime-test-engine-hooks.exe` under Wine (`kiln/native/tests/`).
 
+## Keyboard shortcuts through the host (dev.24)
+
+`shroudforge.input.is_keybind_down` and `was_keybind_pressed` take key state from a hidden child process,
+`<game>/shroudforge/shroudforge.exe --keyboard-input`. Kiln's bundled component has no `shroudforge.exe`, so without an
+installed ShroudForge every mod keybind answered "not held". A host that sees the game window's input can feed the
+state itself:
+
+```
+shroudforge_input_host_version()                       // 1
+shroudforge_input_host_begin()                         // before shroudforge_create; 0 = SF's own input already runs
+shroudforge_input_host_raw_key(make_code, flags, vkey) // one RAWKEYBOARD record of WM_INPUT, unchanged
+shroudforge_input_host_window_key(wparam, lparam)      // WM_KEYDOWN/UP, WM_SYSKEYDOWN/UP, unchanged
+shroudforge_input_host_mouse_button(button, down)      // 1 left, 2 middle, 3 right, 4, 5
+shroudforge_input_host_reset()                         // the game window lost the keyboard focus
+shroudforge_input_host_end()
+```
+
+They are optional exports of `shroudforge-runtime.dll`, declared with the host's rules in `kiln/abi/input_host.h`
+(code in `modules/hotkeys/host_input.rs` and `host_keyboard.c`). Keys are translated with SDL's own Windows scan-code
+table, so a key gets the `SDL:<n>` code that ShroudForge's settings store. While a host feeds, the runtime starts
+neither the helper process nor SDL input. Key names for `shroudforge.input.keybind_label` come from the system
+keyboard layout. A host that never calls `begin`, such as ShroudForge's own `winmm.dll` bootstrap, gets the behaviour
+of upstream unchanged. `kiln/build.sh` fails when the built DLL lacks one of these exports; `kiln/check-contract.py`
+compares the Rust definitions with the header. Tests: `cargo xwin test -p shroudforge-hotkeys --target
+x86_64-pc-windows-msvc` with Wine as the runner (no game, no window).
+
 ## Merging upstream
 
 ```

@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_sdl_cache.rs");
     println!("cargo:rerun-if-changed=sdl_keyboard.c");
+    println!("cargo:rerun-if-changed=host_keyboard.c");
     println!("cargo:rerun-if-changed=SDL/src/events/scancodes_windows.h");
     println!("cargo:rerun-if-changed=SDL");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
@@ -91,6 +92,8 @@ fn main() {
     let mut adapter = cc::Build::new();
     adapter
         .file(directory.join("sdl_keyboard.c"))
+        // Kiln layer: key translation for a host-fed runtime (host_input.rs).
+        .file(directory.join("host_keyboard.c"))
         .include(source.join("include"))
         // The legacy-key migration shares SDL's own private Windows scan-code
         // table instead of maintaining a second copy of that mapping.
