@@ -492,6 +492,11 @@ bool read_procedure(std::uintptr_t entry, Procedure& output, const FileImage* fi
 
 bool ReadProcedure(std::uintptr_t entry, Procedure& output) { return read_procedure(entry, output, nullptr); }
 
+bool ReadOriginalProcedure(std::uintptr_t entry, Procedure& output, bool& foreign) {
+    foreign = differs_from_file(entry);
+    return read_procedure(entry, output, foreign ? &file_image() : nullptr);
+}
+
 bool ReadContainingProcedure(std::uintptr_t address, Procedure& output) {
     try {
         const auto& im = image();
